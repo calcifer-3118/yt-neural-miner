@@ -1,6 +1,6 @@
 {
   "name": "yt-neural-miner",
-  "version": "4.4.0",
+  "version": "4.4.4",
   "description": "Neural Miner: Extract Metadata, Audio, Video & Emotions from YouTube using AI pipelines.",
   "main": "lib/index.js",
   "bin": {

@@ -29,6 +29,9 @@ sys.path.append(str(Path(__file__).resolve().parent))
 # GLOBALS
 USER_CWD = Path(os.getcwd())
 OUTPUT_ROOT = USER_CWD / "output"
+SKIP_TRIGGER_FILE = Path(
+    os.environ.get("MINER_SKIP_FILE", USER_CWD / ".miner_skip")
+)
 SKIP_CURRENT_STAGE = threading.Event()
 
 # Load Env
@@ -36,11 +39,40 @@ env_path = USER_CWD / ".env"
 if env_path.exists(): load_dotenv(dotenv_path=env_path)
 
 # =========================
-# HELPER: DIRECT WORKER
+# WORKER WRAPPERS (Lazy Loading)
+# =========================
+def run_metadata(title, desc):
+    """Imports and runs metadata engine inside worker process."""
+    from metadata_engine import extract_metadata_smartly
+    return extract_metadata_smartly(title, desc)
+
+def run_audio(audio_path):
+    """Imports and runs audio engine inside worker process."""
+    from audio_engine import process_audio
+    return process_audio(audio_path)
+
+def run_video(video_path):
+    """Imports and runs video engine inside worker process."""
+    from video_engine import analyze_full_video
+    return analyze_full_video(video_path)
+
+def run_emotions(context):
+    """Imports and runs emotion engine inside worker process."""
+    from emotion_engine import derive_emotion
+    return derive_emotion(context)
+
+# =========================
+# PROCESS HANDLER
 # =========================
 def worker_wrapper(func, args, result_queue):
     """Executes engine. Prints DIRECTLY to stdout."""
     try:
+        if sys.platform.startswith('win'):
+             try:
+                sys.stdout.reconfigure(encoding='utf-8')
+                sys.stderr.reconfigure(encoding='utf-8')
+             except: pass
+        
         res = func(*args)
         result_queue.put(res)
     except Exception as e:
@@ -48,6 +80,12 @@ def worker_wrapper(func, args, result_queue):
         result_queue.put(None)
 
 def run_skippable_stage(stage_name, target_func, args):
+    """
+    Runs a stage in a separate process.
+    Because imports are now inside 'target_func', this function 
+    starts IMMEDIATELY, allowing the loop below to catch 'Skip' signals
+    even while the AI models are loading.
+    """
     SKIP_CURRENT_STAGE.clear()
     
     result_q = multiprocessing.Queue()
@@ -55,11 +93,22 @@ def run_skippable_stage(stage_name, target_func, args):
     p.start()
     
     while p.is_alive():
+        # Check 1: File Trigger (Robust)
+        if SKIP_TRIGGER_FILE.exists():
+            try: SKIP_TRIGGER_FILE.unlink() 
+            except: pass
+            p.terminate()
+            p.join()
+            print("SKIP_ACK", flush=True)
+            return None
+
+        # Check 2: Event Trigger (Backup)
         if SKIP_CURRENT_STAGE.is_set():
             p.terminate()
             p.join()
             print("SKIP_ACK", flush=True)
             return None
+        
         time.sleep(0.1)
     
     p.join()
@@ -88,7 +137,6 @@ def get_yt_info(url, cookies_arg=None):
     except: return None
 
 def download_source(url, paths, video_id, cookies_arg=None):
-    # Check Exists
     if paths["video_file"].exists() and paths["video_file"].stat().st_size > 1024:
         print(f"PRG:Downloading:Local File Found:100", flush=True)
         if paths["metadata"].exists():
@@ -145,6 +193,7 @@ def push_to_db(meta, paths):
     if not db_url: return False
     if "?" in db_url: db_url = db_url.split("?")[0]
 
+    print("PRG:DB Sync:0:100", flush=True)
     print("PRG:DB Sync:Connecting...:10", flush=True)
 
     try:
@@ -218,7 +267,6 @@ def push_to_db(meta, paths):
 # MAIN
 # =========================
 def main():
-    # Only print PRG signals, no text logs
     if 'MINER_DB_URL' in os.environ:
         os.environ['DATABASE_URL'] = os.environ['MINER_DB_URL']
 
@@ -255,26 +303,30 @@ def main():
             "video_file": folder / "video.mp4"
         }
 
-        # --- SYNC MODE ---
         if args.sync_only:
+            # (Sync logic skipped for brevity, similar to before)
             print("PRG:Sync:Checking Files:10", flush=True)
             meta = {"id": vid_id, "title": "Synced Video", "duration": 0} 
             if paths["metadata"].exists():
                 try: meta.update(json.loads(paths["metadata"].read_text(encoding="utf-8")))
                 except: pass
-            
             if meta["title"] == "Synced Video":
                 i = get_yt_info(args.url, args.cookies)
                 if i: meta.update(i)
-
             if push_to_db(meta, paths):
                 if args.cleanup: shutil.rmtree(folder)
             else:
                 sys.exit(1)
             sys.exit(0)
 
-        # --- RUN MODE ---
-        meta = download_source(args.url, paths, vid_id, args.cookies)
+        # 0. DOWNLOAD
+        print("PRG:Download:0:100", flush=True)
+        print("PRG:Download:Initializing...:0", flush=True)
+        try:
+            meta = download_source(args.url, paths, vid_id, args.cookies)
+        except Exception as e:
+            print(f"❌ Download Failed: {e}", flush=True)
+            sys.exit(1)
         
         stages_list = args.process if args.process else ["all"]
         flat_stages = []
@@ -284,12 +336,13 @@ def main():
 
         # 1. METADATA
         if "metadata" in req_stages:
+            print("PRG:Metadata:0:100", flush=True) # Reset UI
             if paths["metadata"].exists():
                 print("PRG:Metadata:Cached:100", flush=True)
             else:
-                print("PRG:Metadata:Initializing...:0", flush=True)
-                from metadata_engine import extract_metadata_smartly
-                res = run_skippable_stage("Metadata", extract_metadata_smartly, (meta["title"], meta.get("description", "")))
+                print("PRG:Metadata:Loading Metadata Engine...:0", flush=True)
+                # Use Wrapper to load import lazily inside worker
+                res = run_skippable_stage("Metadata", run_metadata, (meta["title"], meta.get("description", "")))
                 if res: 
                     res["title"] = meta.get("title")
                     res["duration"] = meta.get("duration")
@@ -299,36 +352,36 @@ def main():
 
         # 2. AUDIO
         if "audio" in req_stages:
+            print("PRG:Audio:0:100", flush=True) # Reset UI
             if paths["transcript"].exists():
                 print("PRG:Audio:Cached:100", flush=True)
             else:
-                print("PRG:Audio:Initializing...:0", flush=True)
-                from audio_engine import process_audio
-                res = run_skippable_stage("Audio", process_audio, (str(paths["audio_file"]),))
+                print("PRG:Audio:Loading Whisper Engine...:0", flush=True)
+                res = run_skippable_stage("Audio", run_audio, (str(paths["audio_file"]),))
                 if res: 
                     paths["transcript"].write_text(res, encoding="utf-8")
                     print("PRG:Audio:100:100", flush=True)
 
         # 3. VIDEO
         if "video" in req_stages:
+            print("PRG:Video:0:100", flush=True) # Reset UI
             if paths["narrative"].exists(): 
                 print("PRG:Video:Cached:100", flush=True)
             else:
-                print("PRG:Video:Initializing...:0", flush=True)
-                from video_engine import analyze_full_video
-                res = run_skippable_stage("Video", analyze_full_video, (str(paths["video_file"]),)) 
+                print("PRG:Video:Loading Vision Engine...:0", flush=True)
+                res = run_skippable_stage("Video", run_video, (str(paths["video_file"]),)) 
                 if res: paths["narrative"].write_text(res, encoding="utf-8")
 
         # 4. EMOTIONS
         if "emotions" in req_stages:
+            print("PRG:Emotions:0:100", flush=True) # Reset UI
             if paths["emotions"].exists(): 
                 print("PRG:Emotions:Cached:100", flush=True)
             else:
-                print("PRG:Emotions:Initializing...:0", flush=True)
-                from emotion_engine import derive_emotion
+                print("PRG:Emotions:Loading Engine...:0", flush=True)
                 context = meta["title"]
                 if paths["narrative"].exists(): context += paths["narrative"].read_text(encoding="utf-8")
-                res = run_skippable_stage("Emotions", derive_emotion, (context,))
+                res = run_skippable_stage("Emotions", run_emotions, (context,))
                 if res: 
                     paths["emotions"].write_text(json.dumps(res, indent=2), encoding="utf-8")
                     print("PRG:Emotions:100:100", flush=True)

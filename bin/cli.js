@@ -5,7 +5,7 @@ const { runScheduler } = require("../lib/index");
 const inquirer = require("inquirer");
 const fs = require("fs");
 
-program.name("miner").description("Neural Miner").version("2.6.0");
+program.name("miner").description("Neural Miner").version("4.4.4");
 
 function parseInput(input) {
   if (fs.existsSync(input)) {
@@ -33,7 +33,11 @@ async function getDbUrl(provided) {
 
 program
   .command("run <input>")
-  .option("-p, --process <items...>", "Stages", "all")
+  .option(
+    "-p, --process <items...>",
+    "Stages (metadata, audio, video, emotions)",
+    "all"
+  )
   .option("--mode <type>", "Mode: db/local", null)
   .option("--db <url>", "DB URL", null)
   .option("--cookies <source>", "Cookies path", null)
@@ -41,6 +45,8 @@ program
   .action(async (input, options) => {
     let mode = options.mode;
     let dbUrl = options.db;
+
+    // Mode Selection
     if (!mode) {
       const ans = await inquirer.prompt([
         {
@@ -57,7 +63,8 @@ program
     }
     if (mode === "db") dbUrl = await getDbUrl(dbUrl);
 
-    let stages = options.stages || "all";
+    // FIX: Read 'process' instead of 'stages'
+    let stages = options.process || "all";
     if (Array.isArray(stages) && stages.includes("all")) stages = "all";
 
     runScheduler(
