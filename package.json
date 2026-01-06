@@ -1,0 +1,44 @@
+{
+  "name": "yt-neural-miner",
+  "version": "4.4.0",
+  "description": "Neural Miner: Extract Metadata, Audio, Video & Emotions from YouTube using AI pipelines.",
+  "main": "lib/index.js",
+  "bin": {
+    "miner": "./bin/cli.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "postinstall": "node scripts/install_python_deps.js"
+  },
+  "keywords": [
+    "youtube-dl",
+    "ai",
+    "miner",
+    "neural",
+    "metadata",
+    "audio",
+    "video",
+    "emotions",
+    "analysis"
+  ],
+  "author": "Dheer Jain",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/calcifer-3118/yt-neural-miner.git"
+  },
+  "bugs": {
+    "url": "https://github.com/calcifer-3118/yt-neural-miner/issues"
+  },
+  "homepage": "https://github.com/calcifer-3118/yt-neural-miner#readme",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "cli-progress": "^3.12.0",
+    "commander": "^11.1.0",
+    "dotenv": "^16.4.5",
+    "inquirer": "^8.2.6"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

@@ -1,0 +1,14 @@
+ollama
+psycopg2-binary
+sentence-transformers
+python-dotenv
+yt-dlp
+openai-whisper
+torch
+torchvision
+transformers
+qwen_vl_utils
+accelerate
+opencv-python-headless
+pillow
+numpy
