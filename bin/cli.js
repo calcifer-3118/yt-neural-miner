@@ -4,8 +4,9 @@ const { program } = require("commander");
 const { runScheduler } = require("../lib/index");
 const inquirer = require("inquirer");
 const fs = require("fs");
+const pkg = require("../package.json");
 
-program.name("miner").description("Neural Miner").version("4.4.4");
+program.name("miner").description("Neural Miner").version(pkg.version);
 
 function parseInput(input) {
   if (fs.existsSync(input)) {
