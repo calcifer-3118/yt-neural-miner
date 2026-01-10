@@ -9,6 +9,8 @@ import multiprocessing
 import subprocess
 import urllib.parse
 import time
+import re  # REQUIRED for ID extraction
+import cv2 
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -39,25 +41,84 @@ env_path = USER_CWD / ".env"
 if env_path.exists(): load_dotenv(dotenv_path=env_path)
 
 # =========================
-# WORKER WRAPPERS (Lazy Loading)
+# HELPER: ID EXTRACTION (CRITICAL FIX)
+# =========================
+def extract_video_id(url):
+    """
+    Robustly extracts the 11-character YouTube Video ID.
+    Handles:
+      - standard: youtube.com/watch?v=ID
+      - short: youtu.be/ID
+      - shorts: youtube.com/shorts/ID
+      - embed: youtube.com/embed/ID
+      - dirty: url?list=...&t=...
+    """
+    # 1. Regex for standard 11-char ID patterns
+    patterns = [
+        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',          # v=ID or /ID
+        r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',      # youtu.be/ID
+        r'(?:embed\/)([0-9A-Za-z_-]{11})',          # embed/ID
+        r'(?:shorts\/)([0-9A-Za-z_-]{11})'          # shorts/ID
+    ]
+    
+    for p in patterns:
+        match = re.search(p, url)
+        if match:
+            return match.group(1)
+            
+    # 2. Fallback: Parse URL object
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.hostname == 'youtu.be':
+            return parsed.path.strip('/')
+        if parsed.query:
+            qs = urllib.parse.parse_qs(parsed.query)
+            if 'v' in qs:
+                return qs['v'][0]
+    except: pass
+    
+    # 3. Last Resort: Return last 11 chars if they look valid
+    clean = re.sub(r'[^a-zA-Z0-9_-]', '', url)
+    if len(clean) >= 11:
+        return clean[-11:]
+        
+    print(f"❌ Error: Could not extract Video ID from: {url}", flush=True)
+    sys.exit(1)
+
+# =========================
+# HELPER: SYSTEM CHECKS
+# =========================
+def verify_video_file(file_path):
+    """Returns True if the file is a valid VIDEO (has visual frames)."""
+    if not os.path.exists(file_path): return False
+    if os.path.getsize(file_path) < 50 * 1024: return False 
+    
+    try:
+        cap = cv2.VideoCapture(str(file_path))
+        if not cap.isOpened(): return False
+        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        cap.release()
+        return frames > 0 and width > 0
+    except:
+        return False
+
+# =========================
+# WORKER WRAPPERS
 # =========================
 def run_metadata(title, desc):
-    """Imports and runs metadata engine inside worker process."""
     from metadata_engine import extract_metadata_smartly
     return extract_metadata_smartly(title, desc)
 
 def run_audio(audio_path):
-    """Imports and runs audio engine inside worker process."""
     from audio_engine import process_audio
     return process_audio(audio_path)
 
 def run_video(video_path):
-    """Imports and runs video engine inside worker process."""
     from video_engine import analyze_full_video
     return analyze_full_video(video_path)
 
 def run_emotions(context):
-    """Imports and runs emotion engine inside worker process."""
     from emotion_engine import derive_emotion
     return derive_emotion(context)
 
@@ -65,14 +126,12 @@ def run_emotions(context):
 # PROCESS HANDLER
 # =========================
 def worker_wrapper(func, args, result_queue):
-    """Executes engine. Prints DIRECTLY to stdout."""
     try:
         if sys.platform.startswith('win'):
              try:
                 sys.stdout.reconfigure(encoding='utf-8')
                 sys.stderr.reconfigure(encoding='utf-8')
              except: pass
-        
         res = func(*args)
         result_queue.put(res)
     except Exception as e:
@@ -80,20 +139,12 @@ def worker_wrapper(func, args, result_queue):
         result_queue.put(None)
 
 def run_skippable_stage(stage_name, target_func, args):
-    """
-    Runs a stage in a separate process.
-    Because imports are now inside 'target_func', this function 
-    starts IMMEDIATELY, allowing the loop below to catch 'Skip' signals
-    even while the AI models are loading.
-    """
     SKIP_CURRENT_STAGE.clear()
-    
     result_q = multiprocessing.Queue()
     p = multiprocessing.Process(target=worker_wrapper, args=(target_func, args, result_q))
     p.start()
     
     while p.is_alive():
-        # Check 1: File Trigger (Robust)
         if SKIP_TRIGGER_FILE.exists():
             try: SKIP_TRIGGER_FILE.unlink() 
             except: pass
@@ -102,13 +153,11 @@ def run_skippable_stage(stage_name, target_func, args):
             print("SKIP_ACK", flush=True)
             return None
 
-        # Check 2: Event Trigger (Backup)
         if SKIP_CURRENT_STAGE.is_set():
             p.terminate()
             p.join()
             print("SKIP_ACK", flush=True)
             return None
-        
         time.sleep(0.1)
     
     p.join()
@@ -116,7 +165,6 @@ def run_skippable_stage(stage_name, target_func, args):
     return None
 
 def input_listener():
-    """Reads stdin for control commands."""
     while True:
         try:
             line = sys.stdin.readline()
@@ -126,7 +174,7 @@ def input_listener():
         except: break
 
 # =========================
-# DOWNLOADER
+# DOWNLOADER (CLIENT EMULATION)
 # =========================
 def get_yt_info(url, cookies_arg=None):
     import yt_dlp
@@ -137,7 +185,7 @@ def get_yt_info(url, cookies_arg=None):
     except: return None
 
 def download_source(url, paths, video_id, cookies_arg=None):
-    if paths["video_file"].exists() and paths["video_file"].stat().st_size > 1024:
+    if paths["video_file"].exists() and verify_video_file(paths["video_file"]):
         print(f"PRG:Downloading:Local File Found:100", flush=True)
         if paths["metadata"].exists():
             try: return json.loads(paths["metadata"].read_text(encoding="utf-8"))
@@ -146,8 +194,8 @@ def download_source(url, paths, video_id, cookies_arg=None):
         return info if info else {"id": video_id, "title": f"Video {video_id}", "duration": 0}
 
     print("PRG:Downloading:Starting...:0", flush=True)
-    
     import yt_dlp
+    
     def progress_hook(d):
         if d['status'] == 'downloading':
             try:
@@ -155,35 +203,121 @@ def download_source(url, paths, video_id, cookies_arg=None):
                 print(f"PRG:Downloading:{p}:100", flush=True)
             except: pass
 
-    out_tmpl = str(paths["folder"] / "video.%(ext)s")
-    ydl_opts = {
-        'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': out_tmpl,
-        'noplaylist': True,
-        'progress_hooks': [progress_hook],
-        'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
-        'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
-    }
-    if cookies_arg and os.path.exists(cookies_arg): ydl_opts['cookiefile'] = cookies_arg
+    # Strategies to bypass throttling
+    strategies = [
+        {
+            'name': 'Android Client (720p)',
+            'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best',
+            'client': 'android' 
+        },
+        {
+            'name': 'iOS Client (Robust)',
+            'format': 'best', 
+            'client': 'ios'
+        },
+        {
+            'name': 'Web Client Fallback',
+            'format': 'bestvideo[height<=480]+bestaudio/best',
+            'client': 'web'
+        }
+    ]
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            
-        if not paths["video_file"].exists():
-            for f in paths["folder"].glob("video.*"):
-                if f.suffix != ".mp4": shutil.move(f, paths["video_file"]); break
+    download_success_type = None
+    info = None
+
+    for attempt, strategy in enumerate(strategies):
+        print(f"PRG:Downloading:Attempt {attempt+1} ({strategy['name']})...:0", flush=True)
         
-        print("PRG:Audio Extraction:50:100", flush=True)
+        # Cleanup
+        for f in paths["folder"].glob("video.*"):
+            try: f.unlink()
+            except: pass
+
+        ydl_opts = {
+            'outtmpl': str(paths["folder"] / "video.%(ext)s"),
+            'format': strategy['format'],
+            'extractor_args': {'youtube': {'player_client': [strategy['client']]}},
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+            'ignoreerrors': True,
+            'progress_hooks': [progress_hook],
+            'merge_output_format': 'mp4'
+        }
+        if cookies_arg and os.path.exists(cookies_arg): ydl_opts['cookiefile'] = cookies_arg
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            
+            # --- FILE DETECTION ---
+            candidates = list(paths["folder"].glob("video.*"))
+            
+            # 1. Search for VIDEO
+            video_files = [f for f in candidates if f.suffix in ['.mp4', '.mkv', '.webm']]
+            if video_files:
+                target = max(video_files, key=lambda f: f.stat().st_size)
+                
+                if verify_video_file(target):
+                    if target.name != "video.mp4":
+                        if paths["video_file"].exists(): paths["video_file"].unlink()
+                        shutil.move(str(target), str(paths["video_file"]))
+                    
+                    print(f" ✅ Valid video verified ({os.path.getsize(paths['video_file'])/(1024*1024):.1f}MB)", flush=True)
+                    download_success_type = "video"
+                    break 
+            
+            # 2. Audio Check
+            audio_files = [f for f in candidates if f.suffix in ['.m4a', '.mp3', '.webm']]
+            if audio_files and not download_success_type:
+                target = max(audio_files, key=lambda f: f.stat().st_size)
+                print(f" ⚠️ Only Audio found ({strategy['client']}).", flush=True)
+
+        except Exception as e:
+            print(f" ⚠️ Strategy failed: {e}", flush=True)
+
+    if not download_success_type:
+        # Fallback to Audio-Only
+        candidates = list(paths["folder"].glob("video.*"))
+        audio_files = [f for f in candidates if f.suffix in ['.m4a', '.mp3', '.webm', '.mkv', '.mp4']]
+        
+        if audio_files:
+             target = max(audio_files, key=lambda f: f.stat().st_size)
+             print(f" ⚠️ CRITICAL: Video unavailable. Using Audio-Only: {target.name}", flush=True)
+             
+             temp_audio = paths["folder"] / f"source_audio{target.suffix}"
+             if temp_audio.exists(): temp_audio.unlink()
+             shutil.move(str(target), str(temp_audio))
+             
+             if paths["video_file"].exists(): paths["video_file"].unlink()
+             download_success_type = "audio_only"
+        else:
+             raise Exception("Failed to download any content.")
+
+    # --- FINAL EXTRACTION ---
+    print("PRG:Audio Extraction:50:100", flush=True)
+
+    if download_success_type == "video":
         subprocess.run([
-            "ffmpeg", "-y", "-loglevel", "error", "-i", str(paths["video_file"]), 
-            "-vn", "-acodec", "libmp3lame", str(paths["audio_file"])
+            "ffmpeg", "-y", "-loglevel", "error", 
+            "-i", str(paths["video_file"]), 
+            "-vn", "-acodec", "libmp3lame", "-q:a", "2", 
+            str(paths["audio_file"])
         ], check=True, stdin=subprocess.DEVNULL)
-        print("PRG:Audio Extraction:100:100", flush=True)
-        return info
-    except Exception as e:
-        print(f"❌ Download Failed: {e}", flush=True)
-        raise e
+        
+    elif download_success_type == "audio_only":
+        source = next(paths["folder"].glob("source_audio.*"), None)
+        if source:
+            subprocess.run([
+                "ffmpeg", "-y", "-loglevel", "error", 
+                "-i", str(source), 
+                "-acodec", "libmp3lame", "-q:a", "2", 
+                str(paths["audio_file"])
+            ], check=True, stdin=subprocess.DEVNULL)
+
+    print("PRG:Audio Extraction:100:100", flush=True)
+    return info
 
 # =========================
 # DB SYNC
@@ -275,11 +409,17 @@ def main():
     parser.add_argument("--process", action="append")
     parser.add_argument("--mode", default="local")
     parser.add_argument("--cleanup", action="store_true")
+    parser.add_argument("--force", action="store_true", help="Force overwrite")
     parser.add_argument("--models_dir")
     parser.add_argument("--cookies")
     parser.add_argument("--sync_only", action="store_true")
+    parser.add_argument("--skip_file", default=None)
     parser.add_argument("--non-interactive", action="store_true")
     args = parser.parse_args()
+
+    if args.skip_file:
+        global SKIP_TRIGGER_FILE
+        SKIP_TRIGGER_FILE = Path(args.skip_file)
 
     if args.models_dir:
         os.environ["HF_HOME"] = args.models_dir
@@ -290,7 +430,10 @@ def main():
         t.start()
 
     try:
-        vid_id = args.url.split("v=")[-1].split("&")[0]
+        # FIX: EXTRACT ID ROBUSTLY
+        vid_id = extract_video_id(args.url)
+        print(f"   ▶ Detected ID: {vid_id}", flush=True)
+        
         folder = OUTPUT_ROOT / vid_id
         folder.mkdir(parents=True, exist_ok=True)
         paths = {
@@ -304,7 +447,6 @@ def main():
         }
 
         if args.sync_only:
-            # (Sync logic skipped for brevity, similar to before)
             print("PRG:Sync:Checking Files:10", flush=True)
             meta = {"id": vid_id, "title": "Synced Video", "duration": 0} 
             if paths["metadata"].exists():
@@ -322,6 +464,18 @@ def main():
         # 0. DOWNLOAD
         print("PRG:Download:0:100", flush=True)
         print("PRG:Download:Initializing...:0", flush=True)
+        
+        if args.force:
+            if paths["video_file"].exists(): 
+                try: paths["video_file"].unlink()
+                except: pass
+            if paths["audio_file"].exists():
+                try: paths["audio_file"].unlink()
+                except: pass
+            for f in paths["folder"].glob("source_audio.*"):
+                try: f.unlink()
+                except: pass
+
         try:
             meta = download_source(args.url, paths, vid_id, args.cookies)
         except Exception as e:
@@ -336,12 +490,11 @@ def main():
 
         # 1. METADATA
         if "metadata" in req_stages:
-            print("PRG:Metadata:0:100", flush=True) # Reset UI
-            if paths["metadata"].exists():
+            print("PRG:Metadata:0:100", flush=True)
+            if paths["metadata"].exists() and not args.force:
                 print("PRG:Metadata:Cached:100", flush=True)
             else:
                 print("PRG:Metadata:Loading Metadata Engine...:0", flush=True)
-                # Use Wrapper to load import lazily inside worker
                 res = run_skippable_stage("Metadata", run_metadata, (meta["title"], meta.get("description", "")))
                 if res: 
                     res["title"] = meta.get("title")
@@ -352,8 +505,8 @@ def main():
 
         # 2. AUDIO
         if "audio" in req_stages:
-            print("PRG:Audio:0:100", flush=True) # Reset UI
-            if paths["transcript"].exists():
+            print("PRG:Audio:0:100", flush=True)
+            if paths["transcript"].exists() and not args.force:
                 print("PRG:Audio:Cached:100", flush=True)
             else:
                 print("PRG:Audio:Loading Whisper Engine...:0", flush=True)
@@ -364,18 +517,22 @@ def main():
 
         # 3. VIDEO
         if "video" in req_stages:
-            print("PRG:Video:0:100", flush=True) # Reset UI
-            if paths["narrative"].exists(): 
+            print("PRG:Video:0:100", flush=True)
+            if paths["narrative"].exists() and not args.force: 
                 print("PRG:Video:Cached:100", flush=True)
             else:
-                print("PRG:Video:Loading Vision Engine...:0", flush=True)
-                res = run_skippable_stage("Video", run_video, (str(paths["video_file"]),)) 
-                if res: paths["narrative"].write_text(res, encoding="utf-8")
+                if paths["video_file"].exists() and verify_video_file(paths["video_file"]):
+                    print("PRG:Video:Loading Vision Engine...:0", flush=True)
+                    res = run_skippable_stage("Video", run_video, (str(paths["video_file"]),)) 
+                    if res: paths["narrative"].write_text(res, encoding="utf-8")
+                else:
+                    print("PRG:Video:Skipped (Audio Only):100", flush=True)
+                    paths["narrative"].write_text("Analysis Skipped: Audio-Only source.", encoding="utf-8")
 
         # 4. EMOTIONS
         if "emotions" in req_stages:
-            print("PRG:Emotions:0:100", flush=True) # Reset UI
-            if paths["emotions"].exists(): 
+            print("PRG:Emotions:0:100", flush=True)
+            if paths["emotions"].exists() and not args.force: 
                 print("PRG:Emotions:Cached:100", flush=True)
             else:
                 print("PRG:Emotions:Loading Engine...:0", flush=True)
